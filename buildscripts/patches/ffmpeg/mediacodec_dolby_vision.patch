@@ -1,0 +1,114 @@
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+index 2146490..6c5623b 100644
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -56,6 +56,10 @@ typedef struct MediaCodecH264DecContext {
+     int amlogic_mpeg2_api23_workaround;
+ 
+     int use_ndk_codec;
++
++    /* RifTech: Dolby Vision profile of the stream, told by the player (FFmpeg 6.0 does not pass the
++     * container's DOVI configuration to the decoder); -1 = not Dolby Vision. */
++    int dovi_profile;
+ } MediaCodecH264DecContext;
+ 
+ static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
+@@ -303,12 +307,27 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+ }
+ #endif
+ 
++/* MediaCodecInfo.CodecProfileLevel.DolbyVisionProfileDvhe* of an HEVC Dolby Vision profile, 0 for
++ * one MediaCodec has no constant for. */
++static int dovi_android_profile(int dovi_profile)
++{
++    switch (dovi_profile) {
++    case 4: return 0x10;  /* DvheDtr */
++    case 5: return 0x20;  /* DvheStn */
++    case 6: return 0x40;  /* DvheDth */
++    case 7: return 0x80;  /* DvheDtb */
++    case 8: return 0x100; /* DvheSt */
++    default: return 0;
++    }
++}
++
+ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+ {
+     int ret;
+     int sdk_int;
+ 
+     const char *codec_mime = NULL;
++    int dovi_profile = 0;
+ 
+     FFAMediaFormat *format = NULL;
+     MediaCodecH264DecContext *s = avctx->priv_data;
+@@ -349,6 +368,24 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+         ret = hevc_set_extradata(avctx, format);
+         if (ret < 0)
+             goto done;
++
++        /* RifTech: a Dolby Vision profile 5 stream has no HDR10 base layer: a plain HEVC decoder
++         * shows its IPT colours as a green and purple picture. A video/dolby-vision decoder applies
++         * the RPU, as ExoPlayer does. Only when the device has one for this profile; otherwise the
++         * stream goes to the HEVC decoder as before. */
++        dovi_profile = dovi_android_profile(s->dovi_profile);
++        if (dovi_profile) {
++            char *dv_name = ff_AMediaCodecList_getCodecNameByType("video/dolby-vision", dovi_profile, 0, avctx);
++            if (dv_name) {
++                av_log(avctx, AV_LOG_INFO, "Dolby Vision profile %d: using %s\n", s->dovi_profile, dv_name);
++                av_freep(&dv_name);
++                codec_mime = "video/dolby-vision";
++                ff_AMediaFormat_setInt32(format, "profile", dovi_profile);
++            } else {
++                av_log(avctx, AV_LOG_INFO, "Dolby Vision profile %d: no decoder, HEVC instead\n", s->dovi_profile);
++                dovi_profile = 0;
++            }
++        }
+         break;
+ #endif
+ #if CONFIG_MPEG2_MEDIACODEC_DECODER
+@@ -404,6 +441,7 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+ 
+     s->ctx->delay_flush = s->delay_flush;
+     s->ctx->use_ndk_codec = s->use_ndk_codec;
++    s->ctx->profile_override = dovi_profile;
+ 
+     if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {
+         s->ctx = NULL;
+@@ -552,6 +590,8 @@ static const AVOption ff_mediacodec_vdec_options[] = {
+                      OFFSET(delay_flush), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
+     { "ndk_codec", "Use MediaCodec from NDK",
+                    OFFSET(use_ndk_codec), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
++    { "dovi_profile", "Dolby Vision profile of an HEVC stream: decode it with a video/dolby-vision decoder if the device has one",
++                      OFFSET(dovi_profile), AV_OPT_TYPE_INT, {.i64 = -1}, -1, 10, VD },
+     { NULL }
+ };
+ 
+diff --git a/libavcodec/mediacodecdec_common.c b/libavcodec/mediacodecdec_common.c
+index 03bee11..249d298 100644
+--- a/libavcodec/mediacodecdec_common.c
++++ b/libavcodec/mediacodecdec_common.c
+@@ -605,7 +605,8 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
+         }
+     }
+ 
+-    profile = ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
++    profile = s->profile_override > 0 ? s->profile_override
++                                      : ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
+     if (profile < 0) {
+         av_log(avctx, AV_LOG_WARNING, "Unsupported or unknown profile\n");
+     }
+diff --git a/libavcodec/mediacodecdec_common.h b/libavcodec/mediacodecdec_common.h
+index 0ab2903..f911215 100644
+--- a/libavcodec/mediacodecdec_common.h
++++ b/libavcodec/mediacodecdec_common.h
+@@ -71,6 +71,10 @@ typedef struct MediaCodecDecContext {
+     atomic_int serial;
+ 
+     bool use_ndk_codec;
++
++    /* RifTech: codec profile to look the decoder up with instead of the stream's own (a Dolby
++     * Vision profile when the decoder type is video/dolby-vision), 0 = the stream's. */
++    int profile_override;
+ } MediaCodecDecContext;
+ 
+ int ff_mediacodec_dec_init(AVCodecContext *avctx,

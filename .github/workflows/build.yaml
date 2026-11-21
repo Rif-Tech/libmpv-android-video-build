@@ -52,7 +52,7 @@ jobs:
         with:
           draft: false
           prerelease: false
-          tag_name: "riftech-astats-1"
+          tag_name: "riftech-astats-2"
           files: |
             buildscripts/*.zip
             buildscripts/artifacts/**
